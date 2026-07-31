@@ -1,0 +1,6 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+estado.txt
+ultimo_alerta_vida.txt
