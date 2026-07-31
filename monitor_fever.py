@@ -3,6 +3,7 @@ import re
 import unicodedata
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -23,8 +24,10 @@ FEVER_URL = os.getenv("FEVER_URL")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+FUSO_HORARIO = ZoneInfo("America/Sao_Paulo")
+
 ARQUIVO_ESTADO = Path("estado.txt")
-ARQUIVO_ALERTA_VIDA = Path("ultimo_alerta_vida.txt")
+
 
 TEXTOS_INDISPONIVEIS = [
     "não há ingressos à venda",
@@ -34,7 +37,10 @@ TEXTOS_INDISPONIVEIS = [
     "ingressos esgotados",
     "não disponível",
     "nao disponivel",
+    "poxa! adoramos esta experiência",
+    "poxa! adoramos esta experiencia",
 ]
+
 
 TEXTOS_DE_COMPRA = [
     "selecionar assentos",
@@ -44,6 +50,8 @@ TEXTOS_DE_COMPRA = [
     "selecione a data e opcao",
     "escolher ingressos",
     "ver ingressos",
+    "selecionar data",
+    "escolher data",
 ]
 
 
@@ -52,7 +60,7 @@ TEXTOS_DE_COMPRA = [
 # ============================================================
 
 def validar_configuracao() -> None:
-    faltando = []
+    faltando: list[str] = []
 
     if not FEVER_URL:
         faltando.append("FEVER_URL")
@@ -67,7 +75,7 @@ def validar_configuracao() -> None:
         nomes = ", ".join(faltando)
 
         raise RuntimeError(
-            f"As seguintes variáveis estão faltando no .env: {nomes}"
+            f"As seguintes variáveis estão faltando: {nomes}"
         )
 
 
@@ -78,7 +86,10 @@ def validar_configuracao() -> None:
 def normalizar_texto(texto: str) -> str:
     texto = texto.lower()
 
-    texto = unicodedata.normalize("NFD", texto)
+    texto = unicodedata.normalize(
+        "NFD",
+        texto,
+    )
 
     texto = "".join(
         caractere
@@ -86,12 +97,19 @@ def normalizar_texto(texto: str) -> str:
         if unicodedata.category(caractere) != "Mn"
     )
 
-    texto = re.sub(r"\s+", " ", texto)
+    texto = re.sub(
+        r"\s+",
+        " ",
+        texto,
+    )
 
     return texto.strip()
 
 
-def contem_algum(texto: str, possibilidades: list[str]) -> bool:
+def contem_algum(
+    texto: str,
+    possibilidades: list[str],
+) -> bool:
     texto_normalizado = normalizar_texto(texto)
 
     return any(
@@ -106,7 +124,7 @@ def contem_algum(texto: str, possibilidades: list[str]) -> bool:
 
 def enviar_telegram(mensagem: str) -> None:
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
@@ -139,52 +157,37 @@ def carregar_estado_anterior() -> str:
         return "desconhecido"
 
     try:
-        return ARQUIVO_ESTADO.read_text(
+        estado = ARQUIVO_ESTADO.read_text(
             encoding="utf-8"
         ).strip()
+
+        return estado or "desconhecido"
 
     except OSError:
         return "desconhecido"
 
 
 def salvar_estado(estado: str) -> None:
-    ARQUIVO_ESTADO.write_text(
-        estado,
-        encoding="utf-8",
-    )
-
-
-def carregar_data_ultimo_alerta_vida() -> str:
-    if not ARQUIVO_ALERTA_VIDA.exists():
-        return ""
-
     try:
-        return ARQUIVO_ALERTA_VIDA.read_text(
-            encoding="utf-8"
-        ).strip()
+        ARQUIVO_ESTADO.write_text(
+            estado,
+            encoding="utf-8",
+        )
 
-    except OSError:
-        return ""
-
-
-def salvar_data_alerta_vida(data: str) -> None:
-    ARQUIVO_ALERTA_VIDA.write_text(
-        data,
-        encoding="utf-8",
-    )
-
-
-def deve_enviar_alerta_vida(data_atual: str) -> bool:
-    data_ultimo_alerta = carregar_data_ultimo_alerta_vida()
-
-    return data_ultimo_alerta != data_atual
+    except OSError as erro:
+        print(
+            "Não foi possível salvar o estado local: "
+            f"{erro}"
+        )
 
 
 # ============================================================
-# ANÁLISE
+# ANÁLISE DA PÁGINA
 # ============================================================
 
-def classificar_pagina(texto: str) -> tuple[str, str]:
+def classificar_pagina(
+    texto: str,
+) -> tuple[str, str]:
     tem_indisponibilidade = contem_algum(
         texto,
         TEXTOS_INDISPONIVEIS,
@@ -204,28 +207,54 @@ def classificar_pagina(texto: str) -> tuple[str, str]:
     if tem_indisponibilidade:
         return (
             "indisponivel",
-            "A página continua mostrando o aviso de indisponibilidade.",
+            "A página continua mostrando o aviso "
+            "de indisponibilidade.",
         )
 
     return (
         "suspeito",
-        "O aviso antigo desapareceu, mas nenhum botão conhecido foi encontrado.",
+        "O aviso antigo desapareceu, mas nenhum botão "
+        "conhecido de compra foi encontrado.",
     )
 
 
+# ============================================================
+# PLAYWRIGHT
+# ============================================================
+
 def obter_texto_da_pagina() -> tuple[str, str]:
-    with sync_playwright() as playwright:
-        navegador = playwright.chromium.launch(
-            headless=True
+    if not FEVER_URL:
+        raise RuntimeError(
+            "A variável FEVER_URL não está configurada."
         )
 
-        pagina = navegador.new_page(
+    with sync_playwright() as playwright:
+        navegador = playwright.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
+        )
+
+        contexto = navegador.new_context(
             locale="pt-BR",
+            timezone_id="America/Sao_Paulo",
             viewport={
                 "width": 1366,
                 "height": 768,
             },
+            user_agent=(
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/131.0.0.0 "
+                "Safari/537.36"
+            ),
         )
+
+        pagina = contexto.new_page()
 
         try:
             resposta = pagina.goto(
@@ -234,23 +263,110 @@ def obter_texto_da_pagina() -> tuple[str, str]:
                 timeout=60_000,
             )
 
-            if resposta is not None and resposta.status >= 400:
+            if (
+                resposta is not None
+                and resposta.status >= 400
+            ):
                 raise RuntimeError(
-                    f"A Fever retornou HTTP {resposta.status}."
+                    "A Fever retornou o código HTTP "
+                    f"{resposta.status}."
                 )
 
             pagina.wait_for_timeout(5_000)
 
             titulo = pagina.title()
 
-            texto = pagina.locator("body").inner_text(
+            texto = pagina.locator(
+                "body"
+            ).inner_text(
                 timeout=20_000
             )
+
+            if not texto.strip():
+                raise RuntimeError(
+                    "A página foi aberta, mas nenhum texto "
+                    "foi encontrado."
+                )
 
             return titulo, texto
 
         finally:
+            contexto.close()
             navegador.close()
+
+
+# ============================================================
+# ALERTAS
+# ============================================================
+
+def enviar_alerta_disponibilidade(
+    titulo: str,
+    motivo: str,
+    horario: str,
+) -> None:
+    mensagem = (
+        "🚨 INGRESSOS POSSIVELMENTE DISPONÍVEIS!\n\n"
+        f"Evento: {titulo}\n\n"
+        f"{motivo}\n\n"
+        f"Verificado em {horario}\n\n"
+        f"{FEVER_URL}"
+    )
+
+    enviar_telegram(mensagem)
+
+    print("Alerta de disponibilidade enviado.")
+
+
+def enviar_alerta_suspeito(
+    titulo: str,
+    motivo: str,
+    horario: str,
+) -> None:
+    mensagem = (
+        "⚠️ A PÁGINA DA FEVER MUDOU\n\n"
+        "O aviso de indisponibilidade desapareceu, "
+        "mas o monitor ainda não encontrou um botão "
+        "de compra conhecido.\n\n"
+        f"Evento: {titulo}\n"
+        f"Motivo: {motivo}\n"
+        f"Verificado em {horario}\n\n"
+        f"{FEVER_URL}"
+    )
+
+    enviar_telegram(mensagem)
+
+    print("Alerta de página suspeita enviado.")
+
+
+def enviar_alerta_vida(
+    titulo: str,
+    estado: str,
+    motivo: str,
+    horario: str,
+) -> None:
+    mensagem = (
+        "✅ MONITOR FEVER FUNCIONANDO\n\n"
+        "A página foi carregada e analisada "
+        "com sucesso.\n\n"
+        f"Evento: {titulo}\n"
+        f"Estado atual: {estado}\n"
+        f"Motivo: {motivo}\n"
+        f"Verificado em {horario}\n\n"
+        f"{FEVER_URL}"
+    )
+
+    enviar_telegram(mensagem)
+
+    print("Alerta diário de vida enviado.")
+
+
+def esta_no_horario_do_alerta_vida(
+    agora: datetime,
+) -> bool:
+    return (
+        agora.hour == 8
+        and 0 <= agora.minute < 5
+    )
 
 
 # ============================================================
@@ -260,17 +376,27 @@ def obter_texto_da_pagina() -> tuple[str, str]:
 def executar() -> None:
     validar_configuracao()
 
-    agora = datetime.now()
+    agora = datetime.now(
+        FUSO_HORARIO
+    )
 
-    horario = agora.strftime("%d/%m/%Y às %H:%M:%S")
-    data_atual = agora.strftime("%d/%m/%Y")
+    horario = agora.strftime(
+        "%d/%m/%Y às %H:%M:%S"
+    )
 
+    print("=" * 60)
+    print("MONITOR DA FEVER")
+    print("=" * 60)
+    print(f"Horário: {horario}")
     print("Abrindo a página da Fever...")
     print(FEVER_URL)
 
     titulo, texto = obter_texto_da_pagina()
 
-    estado_atual, motivo = classificar_pagina(texto)
+    estado_atual, motivo = classificar_pagina(
+        texto
+    )
+
     estado_anterior = carregar_estado_anterior()
 
     print()
@@ -279,76 +405,69 @@ def executar() -> None:
     print(f"Estado atual: {estado_atual}")
     print(f"Motivo: {motivo}")
 
-    # ========================================================
-    # ALERTA REPETIDO QUANDO HOUVER SINAL DE VENDA
-    # ========================================================
-
+    # Se houver sinal de venda, envia mensagem
+    # em todas as execuções.
     if estado_atual == "disponivel":
-        mensagem = (
-            "🚨 INGRESSOS POSSIVELMENTE DISPONÍVEIS!\n\n"
-            f"{titulo}\n"
-            f"{motivo}\n\n"
-            f"Verificado em {horario}\n\n"
-            f"{FEVER_URL}"
+        enviar_alerta_disponibilidade(
+            titulo=titulo,
+            motivo=motivo,
+            horario=horario,
         )
 
-        enviar_telegram(mensagem)
-
-        print("Alerta de disponibilidade enviado.")
-
+    # Se a página mudar de uma maneira inesperada,
+    # também envia mensagem em todas as execuções.
     elif estado_atual == "suspeito":
-        mensagem = (
-            "⚠️ A PÁGINA DA FEVER MUDOU\n\n"
-            "O aviso de indisponibilidade desapareceu, "
-            "mas o monitor ainda não encontrou um botão "
-            "de compra conhecido.\n\n"
-            f"Título: {titulo}\n"
-            f"Verificado em {horario}\n\n"
-            f"{FEVER_URL}"
+        enviar_alerta_suspeito(
+            titulo=titulo,
+            motivo=motivo,
+            horario=horario,
         )
-
-        enviar_telegram(mensagem)
-
-        print("Alerta de mudança suspeita enviado.")
 
     else:
         print("Ainda não há sinal de venda.")
 
-    # ========================================================
-    # ALERTA DE VIDA UMA VEZ POR DIA
-    # ========================================================
-
-    if deve_enviar_alerta_vida(data_atual):
-        mensagem_vida = (
-            "✅ MONITOR FEVER FUNCIONANDO\n\n"
-            "A página foi carregada e analisada com sucesso.\n\n"
-            f"Evento: {titulo}\n"
-            f"Estado atual: {estado_atual}\n"
-            f"Motivo: {motivo}\n"
-            f"Verificado em {horario}\n\n"
-            f"{FEVER_URL}"
+    # Com cron a cada 5 minutos, essa condição
+    # será verdadeira apenas na execução próxima das 08:00.
+    if esta_no_horario_do_alerta_vida(agora):
+        enviar_alerta_vida(
+            titulo=titulo,
+            estado=estado_atual,
+            motivo=motivo,
+            horario=horario,
         )
-
-        enviar_telegram(mensagem_vida)
-        salvar_data_alerta_vida(data_atual)
-
-        print("Alerta diário de vida enviado.")
 
     salvar_estado(estado_atual)
 
+    print()
+    print("Verificação concluída.")
+    print("=" * 60)
+
+
+# ============================================================
+# INICIALIZAÇÃO
+# ============================================================
 
 if __name__ == "__main__":
     try:
         executar()
 
     except PlaywrightTimeoutError as erro:
-        print(f"Tempo esgotado ao carregar a página: {erro}")
+        print(
+            "Tempo esgotado ao carregar a página: "
+            f"{erro}"
+        )
         raise SystemExit(1)
 
     except requests.RequestException as erro:
-        print(f"Erro de internet ou Telegram: {erro}")
+        print(
+            "Erro de internet ou Telegram: "
+            f"{erro}"
+        )
         raise SystemExit(1)
 
     except Exception as erro:
-        print(f"Erro inesperado: {erro}")
+        print(
+            "Erro inesperado: "
+            f"{erro}"
+        )
         raise SystemExit(1)
